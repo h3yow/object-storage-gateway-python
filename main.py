@@ -1,8 +1,5 @@
-from fastapi import FastAPI
+"""Local object storage gateway entrypoint."""
+from app.api import create_app
+from app.config import load_settings
 
-app = FastAPI()
-
-
-@app.get("/")
-def read_root():
-    return {"Hello": "World"}
+app = create_app(load_settings())
