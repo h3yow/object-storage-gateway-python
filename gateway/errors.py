@@ -40,6 +40,16 @@ class NoSuchUpload(GatewayError):
     status = 404
 
 
+class NoSuchVersion(GatewayError):
+    """A version id was supplied that never existed or has been evicted by
+    the retention policy. Distinct from NoSuchKey so callers can tell
+    "object/history not enabled at all" apart from "that specific version
+    is gone"."""
+
+    code = "NoSuchVersion"
+    status = 404
+
+
 # --- 403 family -----------------------------------------------------------
 class AccessDenied(GatewayError):
     code = "AccessDenied"

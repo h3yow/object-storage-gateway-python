@@ -35,11 +35,19 @@ class GatewayService:
         return bucket
 
     # -- buckets -------------------------------------------------------------
-    def create_bucket(self, identity: str, name: str, policy: dict | None = None) -> BucketMeta:
+    def create_bucket(self, identity: str, name: str, policy: dict | None = None,
+                      versioning_enabled: bool = False, max_versions: int = 0,
+                      max_version_bytes: int = 0) -> BucketMeta:
         if not name or "/" in name or name in (".", ".."):
             from .errors import InvalidRequest
             raise InvalidRequest(f"invalid bucket name: {name!r}")
-        meta = BucketMeta(name=name, owner=identity, policy=policy or {})
+        if max_versions < 0 or max_version_bytes < 0:
+            from .errors import InvalidRequest
+            raise InvalidRequest("retention caps must be >= 0")
+        meta = BucketMeta(name=name, owner=identity, policy=policy or {},
+                          versioning_enabled=versioning_enabled,
+                          max_versions=max_versions,
+                          max_version_bytes=max_version_bytes)
         self.store.create_bucket(meta)
         return meta
 
@@ -63,6 +71,16 @@ class GatewayService:
         self.store.update_bucket(bucket)
         return bucket
 
+    def set_versioning(self, identity: str, name: str, enabled: bool,
+                       max_versions: int | None = None,
+                       max_version_bytes: int | None = None) -> BucketMeta:
+        bucket = self._bucket_or_404(name)
+        if bucket.owner != identity:
+            raise AccessDenied("only the bucket owner may change versioning")
+        return self.store.set_versioning(
+            name, enabled, max_versions=max_versions,
+            max_version_bytes=max_version_bytes)
+
     def delete_bucket(self, identity: str, name: str) -> None:
         self._authorize(name, identity, "delete")
         self.store.delete_bucket(name)
@@ -83,9 +101,36 @@ class GatewayService:
             raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
         return meta
 
-    def read_object(self, identity: str, bucket: str, key: str) -> tuple[ObjectMeta, Iterator[bytes]]:
-        meta = self.get_object_meta(identity, bucket, key)
-        return meta, self.store.read_object_stream(bucket, key)
+    def read_object(self, identity: str, bucket: str, key: str,
+                    version_id: str | None = None) -> tuple[ObjectMeta, Iterator[bytes]]:
+        self._authorize(bucket, identity, "read")
+        meta, f = self.store.open_object_data(bucket, key, version_id=version_id)
+
+        def _stream():
+            try:
+                while True:
+                    buf = f.read(self.store.settings.stream_chunk_size)
+                    if not buf:
+                        break
+                    yield buf
+            finally:
+                f.close()
+
+        return meta, _stream()
+
+    def list_versions(self, identity: str, bucket: str, key: str):
+        self._authorize(bucket, identity, "read")
+        # store raises NoSuchKey / NoSuchVersion as appropriate
+        return self.store.list_versions(bucket, key)
+
+    def restore_version(self, identity: str, bucket: str, key: str,
+                        version_id: str, if_version: int | None = None,
+                        if_absent: bool = False) -> ObjectMeta:
+        # Restore is a new write: write permission and the ordinary
+        # conditional-write rules apply.
+        self._authorize(bucket, identity, "write")
+        return self.store.restore_version(
+            bucket, key, version_id, if_version=if_version, if_absent=if_absent)
 
     def list_objects(self, identity: str, bucket: str, prefix: str = "",
                      marker: str = "", limit: int | None = None):

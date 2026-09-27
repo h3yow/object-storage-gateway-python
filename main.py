@@ -41,8 +41,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # -- buckets -------------------------------------------------------------
     @app.put("/buckets/{bucket}")
     def create_bucket(bucket: str, request: Request, body: dict | None = None):
-        meta = service.create_bucket(identity(request), bucket,
-                                     policy=(body or {}).get("policy"))
+        body = body or {}
+        meta = service.create_bucket(
+            identity(request), bucket, policy=body.get("policy"),
+            versioning_enabled=bool(body.get("versioning_enabled", False)),
+            max_versions=int(body.get("max_versions", 0)),
+            max_version_bytes=int(body.get("max_version_bytes", 0)))
         return {"bucket": meta.to_dict()}
 
     @app.get("/buckets")
@@ -58,10 +62,41 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         meta = service.set_policy(identity(request), bucket, body.get("policy", {}))
         return {"bucket": meta.to_dict()}
 
+    @app.put("/buckets/{bucket}/versioning")
+    def set_versioning(bucket: str, request: Request, body: dict | None = None):
+        body = body or {}
+        if "enabled" not in body:
+            from gateway.errors import InvalidRequest
+            raise InvalidRequest("body requires boolean 'enabled'")
+        meta = service.set_versioning(
+            identity(request), bucket, bool(body["enabled"]),
+            max_versions=body.get("max_versions"),
+            max_version_bytes=body.get("max_version_bytes"))
+        return {"bucket": meta.to_dict()}
+
     @app.delete("/buckets/{bucket}")
     def delete_bucket(bucket: str, request: Request):
         service.delete_bucket(identity(request), bucket)
         return {"deleted": bucket}
+
+    # -- object version history -----------------------------------------------
+    # Registered before the greedy {key:path} object routes so the extra
+    # path segments are captured here.
+    @app.get("/buckets/{bucket}/objects/{key:path}/versions")
+    def list_versions(bucket: str, key: str, request: Request):
+        current_id, versions = service.list_versions(identity(request), bucket, key)
+        return {"key": key, "current_version_id": current_id,
+                "versions": [
+                    {**v.to_dict(), "is_current": v.version_id == current_id}
+                    for v in versions]}
+
+    @app.post("/buckets/{bucket}/objects/{key:path}/versions/{version_id}/restore")
+    def restore_version(bucket: str, key: str, version_id: str, request: Request,
+                        if_version: int | None = Query(default=None),
+                        if_absent: bool = Query(default=False)):
+        meta = service.restore_version(identity(request), bucket, key, version_id,
+                                       if_version=if_version, if_absent=if_absent)
+        return {"object": meta.to_dict()}
 
     # -- objects ---------------------------------------------------------------
     @app.put("/buckets/{bucket}/objects/{key:path}")
@@ -76,11 +111,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"object": meta.to_dict()}
 
     @app.get("/buckets/{bucket}/objects/{key:path}")
-    def get_object(bucket: str, key: str, request: Request):
-        meta, stream = service.read_object(identity(request), bucket, key)
+    def get_object(bucket: str, key: str, request: Request,
+                   version_id: str | None = Query(default=None)):
+        meta, stream = service.read_object(identity(request), bucket, key,
+                                           version_id=version_id)
         return StreamingResponse(stream, media_type="application/octet-stream",
                                  headers={"X-ETag": meta.etag,
                                           "X-Version": str(meta.version),
+                                          "X-Version-Id": meta.version_id,
                                           "Content-Length": str(meta.size)})
 
     @app.head("/buckets/{bucket}/objects/{key:path}")
@@ -89,6 +127,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(status_code=200, content=None,
                             headers={"X-ETag": meta.etag,
                                      "X-Version": str(meta.version),
+                                     "X-Version-Id": meta.version_id,
                                      "Content-Length": str(meta.size)})
 
     @app.get("/buckets/{bucket}/objects")
