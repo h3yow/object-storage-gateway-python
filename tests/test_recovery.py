@@ -80,3 +80,42 @@ def test_orphan_upload_data_removed_on_restart(settings):
     print("  recovery report:", report)
     assert report["orphan_parts_removed"] == 1
     assert client.get("/buckets/b/uploads", headers=ALICE).json()["uploads"] == []
+
+
+def test_version_storage_orphans_recovered(settings):
+    import hashlib
+    import json
+    client = TestClient(create_app(settings))
+    client.put("/buckets/b", headers=ALICE)
+    client.put("/buckets/b/versioning", headers=ALICE, json={"enabled": True})
+    client.put("/buckets/b/objects/k", headers=ALICE, content=b"v1")
+    client.put("/buckets/b/objects/k", headers=ALICE, content=b"v2")
+    client.put("/buckets/b/objects/g", headers=ALICE, content=b"g1")
+    bdir = settings.data_dir / "buckets" / "b"
+    kh = hashlib.sha256(b"k").hexdigest()
+    gh = hashlib.sha256(b"g").hexdigest()
+    print("\n[case] restart with: dangling version data, a data-less VersionMeta, "
+          "and a deleted key whose version files survived a crash mid-delete")
+    # 1) data file without any VersionMeta / key
+    (bdir / "versions-data" / "ghost-key").mkdir(parents=True)
+    (bdir / "versions-data" / "ghost-key" / "deadbeef").write_bytes(b"junk")
+    # 2) VersionMeta without data on a live key -> meta must be removed
+    (bdir / "versions" / kh / "00ff00ff.json").write_text(json.dumps(
+        {"key": "k", "version": 99, "version_id": "00ff00ff",
+         "size": 4, "etag": "x", "created_at": 1.0}))
+    # 3) simulate a crash during delete of g: current meta gone, versions left
+    (bdir / "objects" / f"{gh}.json").unlink()
+    client, report = _reopen(settings)
+    print("  recovery report:", report)
+    assert report["orphan_data_removed"] >= 3  # ghost data + meta-less + g's files
+    # live object intact and its versions still readable
+    assert client.get("/buckets/b/objects/k", headers=ALICE).content == b"v2"
+    versions = client.get("/buckets/b/versions/k", headers=ALICE).json()["versions"]
+    assert [v["version"] for v in versions] == [2, 1]
+    # every remaining data file has a meta and vice versa; no half-cleaned dirs
+    metas = {p.stem for p in (bdir / "versions").rglob("*.json")}
+    datas = {p.name for p in (bdir / "versions-data").rglob("*") if p.is_file()}
+    print("  meta/data files agree:", metas == datas, "count:", len(metas))
+    assert metas == datas
+    assert not (bdir / "versions" / gh).exists()
+    assert not (bdir / "versions-data" / gh).exists()

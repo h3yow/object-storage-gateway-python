@@ -4,7 +4,9 @@ Layout under data_dir:
 
     buckets/<bucket>/bucket.json                 BucketMeta
     buckets/<bucket>/objects/<hash>.json         ObjectMeta   (committed last)
-    buckets/<bucket>/objects-data/<hash>         object bytes (written first)
+    buckets/<bucket>/objects-data/<hash>         object bytes (legacy, non-versioned)
+    buckets/<bucket>/versions/<hash>/<vid>.json  VersionMeta (current + history)
+    buckets/<bucket>/versions-data/<hash>/<vid>  version bytes (immutable once named)
     buckets/<bucket>/uploads/<upload_id>.json    UploadMeta
     buckets/<bucket>/uploads-data/<id>/<part>    part bytes
 
@@ -28,14 +30,15 @@ import hashlib
 import json
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Iterator
 
 from .config import Settings
 from .errors import (BucketAlreadyExists, BucketNotEmpty, EntityTooLarge,
                      InvalidPart, NoSuchBucket, NoSuchKey, NoSuchUpload,
-                     QuotaExceeded, TooManyRequests)
-from .models import BucketMeta, ObjectMeta, PartMeta, UploadMeta, new_id
+                     NoSuchVersion, QuotaExceeded, TooManyRequests)
+from .models import BucketMeta, ObjectMeta, PartMeta, UploadMeta, VersionMeta, new_id
 
 TMP_SUFFIX = ".tmp"
 
@@ -86,6 +89,18 @@ class Store:
     def _uploads_data_dir(self, bucket: str) -> Path:
         return self._bucket_dir(bucket) / "uploads-data"
 
+    def _versions_dir(self, bucket: str, key: str) -> Path:
+        return self._bucket_dir(bucket) / "versions" / _key_hash(key)
+
+    def _versions_data_dir(self, bucket: str, key: str) -> Path:
+        return self._bucket_dir(bucket) / "versions-data" / _key_hash(key)
+
+    def _version_meta_path(self, bucket: str, key: str, version_id: str) -> Path:
+        return self._versions_dir(bucket, key) / f"{version_id}.json"
+
+    def _version_data_path(self, bucket: str, key: str, version_id: str) -> Path:
+        return self._versions_data_dir(bucket, key) / version_id
+
     def _bucket_lock(self, bucket: str) -> threading.RLock:
         with self._global_lock:
             return self._bucket_locks.setdefault(bucket, threading.RLock())
@@ -106,12 +121,18 @@ class Store:
                 report["tmp_removed"] += 1
             objects_dir = bucket_dir / "objects"
             data_dir = bucket_dir / "objects-data"
-            metas = {p.stem for p in objects_dir.glob("*.json")} if objects_dir.exists() else set()
+            current_ids: dict[str, str] = {}
+            if objects_dir.exists():
+                for mp in objects_dir.glob("*.json"):
+                    current_ids[mp.stem] = _read_json(mp).get("version_id", "")
             if data_dir.exists():
                 for data_file in data_dir.iterdir():
-                    if data_file.name not in metas:
+                    # legacy data is live only while the current meta still
+                    # points at it (empty version_id == legacy location).
+                    if current_ids.get(data_file.name, None) != "":
                         data_file.unlink()
                         report["orphan_data_removed"] += 1
+            self._recover_versions_locked(bucket_dir, current_ids, report)
             uploads_dir = bucket_dir / "uploads"
             uploads_data = bucket_dir / "uploads-data"
             upload_ids = {p.stem for p in uploads_dir.glob("*.json")} if uploads_dir.exists() else set()
@@ -124,6 +145,57 @@ class Store:
                         report["orphan_parts_removed"] += 1
         return report
 
+    def _recover_versions_locked(self, bucket_dir: Path,
+                                 current_ids: dict[str, str], report: dict) -> None:
+        """Restore invariants in versions/ and versions-data/:
+
+          * a version whose key has no current ObjectMeta is removed
+            (the key was deleted and a crash interrupted cleanup);
+          * a version data file without matching VersionMeta is removed;
+          * a VersionMeta whose data file is missing is removed.
+        """
+        versions_root = bucket_dir / "versions"
+        vdata_root = bucket_dir / "versions-data"
+        live_meta: dict[Path, Path] = {}  # meta path -> data path
+        if versions_root.exists():
+            for vdir in versions_root.iterdir():
+                if not vdir.is_dir():
+                    continue
+                h = vdir.name
+                data_vdir = vdata_root / h if vdata_root.exists() else None
+                if h not in current_ids:
+                    for p in vdir.glob("*.json"):
+                        p.unlink()
+                        report["orphan_data_removed"] += 1
+                    if data_vdir and data_vdir.exists():
+                        for p in data_vdir.iterdir():
+                            p.unlink()
+                        report["orphan_data_removed"] += 1
+                    vdir.rmdir()
+                    if data_vdir and data_vdir.exists():
+                        data_vdir.rmdir()
+                    continue
+                for mp in vdir.glob("*.json"):
+                    dp = (data_vdir or (vdata_root / h)) / mp.stem
+                    if dp.exists():
+                        live_meta[mp] = dp
+                    else:
+                        mp.unlink()  # metadata without body must never survive
+                        report["orphan_data_removed"] += 1
+        if vdata_root.exists():
+            for data_vdir in vdata_root.iterdir():
+                h = data_vdir.name
+                meta_vdir = versions_root / h
+                live_data = {live_meta[p].name for p in live_meta if p.parent.name == h}
+                for dp in data_vdir.iterdir():
+                    if dp.name not in live_data:
+                        dp.unlink()
+                        report["orphan_data_removed"] += 1
+                if not any(data_vdir.iterdir()):
+                    data_vdir.rmdir()
+                if meta_vdir.exists() and not any(meta_vdir.glob("*.json")):
+                    meta_vdir.rmdir()
+
     # -- buckets -------------------------------------------------------------
     def create_bucket(self, meta: BucketMeta) -> None:
         with self._global_lock:
@@ -133,6 +205,8 @@ class Store:
             self._bucket_dir(meta.name).mkdir(parents=True, exist_ok=True)
             self._objects_dir(meta.name).mkdir(exist_ok=True)
             self._objects_data_dir(meta.name).mkdir(exist_ok=True)
+            (self._bucket_dir(meta.name) / "versions").mkdir(exist_ok=True)
+            (self._bucket_dir(meta.name) / "versions-data").mkdir(exist_ok=True)
             self._uploads_dir(meta.name).mkdir(exist_ok=True)
             self._uploads_data_dir(meta.name).mkdir(exist_ok=True)
             _atomic_write_json(path, meta.to_dict())
@@ -172,16 +246,32 @@ class Store:
                     for p in d.iterdir():
                         p.unlink()
                     d.rmdir()
-            for sub in ("objects", "objects-data", "uploads", "uploads-data"):
-                (bucket_dir / sub).rmdir()
+            for sub in ("objects", "objects-data", "uploads", "uploads-data",
+                        "versions", "versions-data"):
+                sub_dir = bucket_dir / sub
+                if sub in ("versions", "versions-data"):
+                    if sub_dir.exists():
+                        for d in sub_dir.iterdir():
+                            for p in d.iterdir():
+                                p.unlink()
+                            d.rmdir()
+                if sub_dir.exists():
+                    sub_dir.rmdir()
             self._bucket_meta_path(name).unlink()
             bucket_dir.rmdir()
 
     # -- quota -----------------------------------------------------------------
     def _usage_bytes_locked(self) -> int:
         total = 0
+        # Legacy (non-versioned) object bodies. Versioned current bodies are
+        # counted once through their VersionMeta instead.
         for meta_path in (self.root / "buckets").glob("*/objects/*.json"):
-            total += int(_read_json(meta_path)["size"])
+            d = _read_json(meta_path)
+            if not d.get("version_id"):
+                total += int(d["size"])
+        # Every kept version (current included) occupies exactly one data file.
+        for vmeta_path in (self.root / "buckets").glob("*/versions/*/*.json"):
+            total += int(_read_json(vmeta_path)["size"])
         for part in (self.root / "buckets").glob("*/uploads-data/*/*"):
             total += part.stat().st_size
         return total
@@ -195,6 +285,202 @@ class Store:
     def usage_bytes(self) -> int:
         with self._global_lock:
             return self._usage_bytes_locked()
+
+    # -- versioning -----------------------------------------------------------
+    def _list_version_metas_locked(self, bucket: str, key: str) -> list[VersionMeta]:
+        vdir = self._versions_dir(bucket, key)
+        if not vdir.exists():
+            return []
+        metas = [VersionMeta.from_dict(_read_json(p)) for p in vdir.glob("*.json")]
+        metas.sort(key=lambda v: (v.version, v.created_at))
+        return metas
+
+    def list_versions(self, bucket: str, key: str) -> list[VersionMeta]:
+        with self._bucket_lock(bucket):
+            return self._list_version_metas_locked(bucket, key)
+
+    def _eviction_plan_locked(self, bucket: BucketMeta,
+                              versions: list[VersionMeta],
+                              current_vid: str) -> list[VersionMeta]:
+        """Oldest non-current versions are evicted first. The current version
+        is never part of the plan. Both limits apply independently."""
+        history = [v for v in versions if v.version_id != current_vid]
+        history.sort(key=lambda v: (v.version, v.created_at))
+        keep_count = bucket.max_versions - 1 if bucket.max_versions else len(history)
+        keep_bytes = bucket.max_version_bytes
+        total = sum(v.size for v in history)
+        evict: list[VersionMeta] = []
+        for v in history:
+            too_many = (len(history) - len(evict)) > keep_count if bucket.max_versions else False
+            too_big = (total > keep_bytes) if keep_bytes else False
+            if too_many or too_big:
+                evict.append(v)
+                total -= v.size
+            else:
+                break
+        return evict
+
+    def _remove_version_locked(self, bucket: str, key: str, v: VersionMeta) -> None:
+        # metadata first: a crash leaves orphan data only, recoverable.
+        self._version_meta_path(bucket, key, v.version_id).unlink(missing_ok=True)
+        self._version_data_path(bucket, key, v.version_id).unlink(missing_ok=True)
+
+    def _archive_current_locked(self, bucket: str, key: str,
+                                existing: ObjectMeta) -> None:
+        """Preserve the about-to-be-replaced current content as an immutable
+        historical version. A versioned current already has its VersionMeta
+        (written atomically when it became current), so only a pre-versioning
+        legacy body needs migrating. Migration is idempotent across retries."""
+        if existing.version_id:
+            return  # already an immutable, retained version
+        vid = new_id()
+        self._versions_dir(bucket, key).mkdir(parents=True, exist_ok=True)
+        self._versions_data_dir(bucket, key).mkdir(parents=True, exist_ok=True)
+        target_data = self._version_data_path(bucket, key, vid)
+        if not target_data.exists():
+            src = self._objects_data_dir(bucket) / _key_hash(key)
+            tmp = target_data.with_name(target_data.name + TMP_SUFFIX)
+            with open(src, "rb") as fin, open(tmp, "wb") as fout:
+                while True:
+                    buf = fin.read(self.settings.stream_chunk_size)
+                    if not buf:
+                        break
+                    fout.write(buf)
+                fout.flush()
+                os.fsync(fout.fileno())
+            os.replace(tmp, target_data)
+        vmeta = VersionMeta(key=key, version=existing.version, version_id=vid,
+                            size=existing.size, etag=existing.etag,
+                            created_at=existing.updated_at)
+        _atomic_write_json(self._version_meta_path(bucket, key, vid), vmeta.to_dict())
+        # migration complete; legacy body is now redundant (a crash before
+        # this point simply leaves it for recover() to reap)
+        (self._objects_data_dir(bucket) / _key_hash(key)).unlink(missing_ok=True)
+
+    def _commit_versioned_locked(self, bucket: str, bmeta: BucketMeta, key: str,
+                                 existing: ObjectMeta | None,
+                                 tmp_path: Path, size: int, etag: str) -> ObjectMeta:
+        """Promote a fully-staged tmp body to a new current version, archive
+        the previous current, enforce retention and quota. Caller holds the
+        global + bucket locks and has validated write preconditions."""
+        versions = self._list_version_metas_locked(bucket, key)
+        new_vid = new_id()
+        new_version = (existing.version + 1) if existing else 1
+        evict = self._eviction_plan_locked(
+            bmeta, versions + [VersionMeta(
+                key=key, version=new_version, version_id=new_vid,
+                size=size, etag=etag, created_at=0.0)],
+            current_vid=new_vid)
+        # quota: new body added, planned evictions release space; the old
+        # current stays counted (it becomes a retained historical version).
+        self._check_quota_locked(size - sum(v.size for v in evict))
+        if existing is not None:
+            self._archive_current_locked(bucket, key, existing)
+        self._versions_dir(bucket, key).mkdir(parents=True, exist_ok=True)
+        self._versions_data_dir(bucket, key).mkdir(parents=True, exist_ok=True)
+        target_data = self._version_data_path(bucket, key, new_vid)
+        os.replace(tmp_path, target_data)  # data committed first
+        now = time.time()
+        vmeta = VersionMeta(key=key, version=new_version, version_id=new_vid,
+                            size=size, etag=etag, created_at=now)
+        _atomic_write_json(self._version_meta_path(bucket, key, new_vid), vmeta.to_dict())
+        meta = ObjectMeta(key=key, size=size, etag=etag,
+                          version=new_version, version_id=new_vid,
+                          created_at=existing.created_at if existing else now,
+                          updated_at=now)
+        _atomic_write_json(self._objects_dir(bucket) / f"{_key_hash(key)}.json",
+                           meta.to_dict())
+        for v in evict:
+            self._remove_version_locked(bucket, key, v)
+        return meta
+
+    def _stream_into_tmp_locked(self, tmp_path: Path,
+                                chunks: Iterator[bytes]) -> tuple[int, "hashlib._Hash"]:
+        digest = hashlib.sha256()
+        size = 0
+        try:
+            with open(tmp_path, "wb") as f:
+                for chunk in chunks:
+                    size += len(chunk)
+                    if size > self.settings.max_object_size:
+                        raise EntityTooLarge(
+                            f"object exceeds max size {self.settings.max_object_size}")
+                    digest.update(chunk)
+                    f.write(chunk)
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            tmp_path.unlink(missing_ok=True)
+            raise
+        return size, digest
+
+    def get_version_meta(self, bucket: str, key: str, version_id: str) -> VersionMeta | None:
+        with self._bucket_lock(bucket):
+            path = self._version_meta_path(bucket, key, version_id)
+            if not path.exists():
+                return None
+            return VersionMeta.from_dict(_read_json(path))
+
+    def open_version_data(self, bucket: str, key: str, version_id: str):
+        """Open a specific version's body under the bucket lock. The returned
+        file handle is independent of later overwrite/eviction renames and
+        unlinks (POSIX keeps the inode alive for open handles), so header
+        (size/etag) and body always come from the same version."""
+        with self._bucket_lock(bucket):
+            # Read directly: calling get_version_meta() here would re-enter
+            # the global->bucket lock order while holding the bucket lock,
+            # inverting the order writers use and deadlocking under load.
+            path = self._version_meta_path(bucket, key, version_id)
+            if not path.exists():
+                return None, None
+            vmeta = VersionMeta.from_dict(_read_json(path))
+            f = open(self._version_data_path(bucket, key, version_id), "rb")  # noqa: SIM115
+            return vmeta, f
+
+    def promote_version(self, bucket: str, bmeta: BucketMeta, key: str,
+                        version_id: str, if_version: int | None = None,
+                        if_absent: bool = False) -> ObjectMeta:
+        """Re-submit a historical version's content as a brand-new write.
+        Preconditions follow the same rules as a normal overwrite; the source
+        version is never modified (its body is hardlinked into the new
+        version file)."""
+        with self._global_lock, self._bucket_lock(bucket):
+            existing = self.get_object_meta(bucket, key)
+            if if_absent and existing is not None:
+                from .errors import Conflict
+                raise Conflict(f"object '{key}' already exists")
+            if if_version is not None:
+                current = existing.version if existing else 0
+                if current != if_version:
+                    from .errors import PreconditionFailed
+                    raise PreconditionFailed(
+                        f"expected version {if_version}, current version is {current}")
+            source = self.get_version_meta(bucket, key, version_id)
+            if source is None:
+                raise NoSuchVersion(
+                    f"version '{version_id}' of '{key}' does not exist or was evicted")
+            self._versions_data_dir(bucket, key).mkdir(parents=True, exist_ok=True)
+            new_vid_tmp = self._versions_data_dir(bucket, key) / f".promote.{new_id()}{TMP_SUFFIX}"
+            try:
+                os.link(self._version_data_path(bucket, key, version_id), new_vid_tmp)
+            except OSError:  # pragma: no cover - hardlinks assumed on local FS
+                with open(self._version_data_path(bucket, key, version_id), "rb") as fin, \
+                        open(new_vid_tmp, "wb") as fout:
+                    while True:
+                        buf = fin.read(self.settings.stream_chunk_size)
+                        if not buf:
+                            break
+                        fout.write(buf)
+                    fout.flush()
+                    os.fsync(fout.fileno())
+            # hardlink guarantees byte identity: reuse the source's hash/size
+            try:
+                return self._commit_versioned_locked(
+                    bucket, bmeta, key, existing, new_vid_tmp,
+                    source.size, source.etag)
+            except BaseException:
+                new_vid_tmp.unlink(missing_ok=True)
+                raise
 
     # -- objects ---------------------------------------------------------------
     def get_object_meta(self, bucket: str, key: str) -> ObjectMeta | None:
@@ -231,6 +517,7 @@ class Store:
             version matches exactly.
         """
         with self._global_lock, self._bucket_lock(bucket):
+            bmeta = self.get_bucket(bucket)
             existing = self.get_object_meta(bucket, key)
             if if_absent and existing is not None:
                 from .errors import Conflict
@@ -242,31 +529,26 @@ class Store:
                     raise PreconditionFailed(
                         f"expected version {if_version}, current version is {current}")
             h = _key_hash(key)
+            if bmeta is not None and bmeta.versioning_enabled:
+                vdata_dir = self._versions_data_dir(bucket, key)
+                vdata_dir.mkdir(parents=True, exist_ok=True)
+                tmp_path = vdata_dir / f".staging.{new_id()}{TMP_SUFFIX}"
+                size, digest = self._stream_into_tmp_locked(tmp_path, chunks)
+                try:
+                    return self._commit_versioned_locked(
+                        bucket, bmeta, key, existing, tmp_path, size, digest.hexdigest())
+                except BaseException:
+                    tmp_path.unlink(missing_ok=True)
+                    raise
             data_path = self._objects_data_dir(bucket) / h
             tmp_path = data_path.with_name(data_path.name + TMP_SUFFIX)
-            digest = hashlib.sha256()
-            size = 0
-            try:
-                with open(tmp_path, "wb") as f:
-                    for chunk in chunks:
-                        size += len(chunk)
-                        if size > self.settings.max_object_size:
-                            raise EntityTooLarge(
-                                f"object exceeds max size {self.settings.max_object_size}")
-                        digest.update(chunk)
-                        f.write(chunk)
-                    f.flush()
-                    os.fsync(f.fileno())
-            except BaseException:
-                tmp_path.unlink(missing_ok=True)
-                raise
+            size, digest = self._stream_into_tmp_locked(tmp_path, chunks)
             try:
                 self._check_quota_locked(size - (existing.size if existing else 0))
             except BaseException:
                 tmp_path.unlink(missing_ok=True)
                 raise
             os.replace(tmp_path, data_path)  # data committed first
-            now = None
             meta = ObjectMeta(key=key, size=size, etag=digest.hexdigest(),
                               version=(existing.version + 1) if existing else 1)
             if existing:
@@ -275,10 +557,30 @@ class Store:
             return meta
 
     def read_object_stream(self, bucket: str, key: str) -> Iterator[bytes]:
-        """Yield object bytes in bounded chunks; never loads it all."""
+        """Yield the *current* object's bytes in bounded chunks.
+
+        The current version is located and its file opened under the bucket
+        lock; afterwards streaming runs lock-free but against a fixed inode.
+        An overwrite (rename) or eviction (unlink) racing with the read cannot
+        change the open file, so length/etag header and body are guaranteed
+        to describe the same version."""
         meta = self.get_object_meta(bucket, key)
         if meta is None:
             raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
+        if meta.version_id:
+            _, f = self.open_version_data(bucket, key, meta.version_id)
+            if f is None:  # current meta without body: impossible post-recover
+                raise NoSuchKey(f"object '{key}' is unavailable in bucket '{bucket}'")
+            chunk = self.settings.stream_chunk_size
+            try:
+                while True:
+                    buf = f.read(chunk)
+                    if not buf:
+                        break
+                    yield buf
+            finally:
+                f.close()
+            return
         data_path = self._objects_data_dir(bucket) / _key_hash(key)
         chunk = self.settings.stream_chunk_size
         with open(data_path, "rb") as f:
@@ -288,15 +590,49 @@ class Store:
                     break
                 yield buf
 
+    def read_version_stream(self, bucket: str, key: str,
+                            version_id: str) -> tuple[VersionMeta, Iterator[bytes]]:
+        """Stream one specific, immutable historical version. Returns
+        NoSuchVersion if the id never existed or has since been evicted."""
+        vmeta, f = self.open_version_data(bucket, key, version_id)
+        if vmeta is None:
+            raise NoSuchVersion(
+                f"version '{version_id}' of '{key}' does not exist or was evicted")
+        chunk = self.settings.stream_chunk_size
+
+        def _gen():
+            try:
+                while True:
+                    buf = f.read(chunk)
+                    if not buf:
+                        break
+                    yield buf
+            finally:
+                f.close()
+
+        return vmeta, _gen()
+
     def delete_object(self, bucket: str, key: str) -> ObjectMeta:
         with self._global_lock, self._bucket_lock(bucket):
             meta = self.get_object_meta(bucket, key)
             if meta is None:
                 raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
-            # metadata first: a crash leaves recoverable orphan data, never
-            # metadata without a body.
+            # current metadata first: a crash leaves recoverable orphan data,
+            # never metadata without a body.
             (self._objects_dir(bucket) / f"{_key_hash(key)}.json").unlink()
+            vdir = self._versions_dir(bucket, key)
+            vddir = self._versions_data_dir(bucket, key)
+            if vddir.exists():
+                for p in vddir.iterdir():
+                    p.unlink()
+            if vdir.exists():
+                # covers the frozen-history case (versioning was disabled and
+                # the key later overwritten): metadata-less leftover bodies
+                for p in vdir.glob("*.json"):
+                    p.unlink()
             (self._objects_data_dir(bucket) / _key_hash(key)).unlink(missing_ok=True)
+            vddir.rmdir() if vddir.exists() else None
+            vdir.rmdir() if vdir.exists() else None
             return meta
 
     # -- multipart uploads -------------------------------------------------------
@@ -384,6 +720,7 @@ class Store:
                     f"merged object of {total} bytes exceeds max size "
                     f"{self.settings.max_object_size}")
             key = upload.key
+            bmeta = self.get_bucket(bucket)
             existing = self.get_object_meta(bucket, key)
             if if_absent and existing is not None:
                 from .errors import Conflict
@@ -395,8 +732,14 @@ class Store:
                     raise PreconditionFailed(
                         f"expected version {if_version}, current version is {current}")
             h = _key_hash(key)
-            data_path = self._objects_data_dir(bucket) / h
-            tmp_path = data_path.with_name(data_path.name + TMP_SUFFIX)
+            versioned = bmeta is not None and bmeta.versioning_enabled
+            if versioned:
+                vdata_dir = self._versions_data_dir(bucket, key)
+                vdata_dir.mkdir(parents=True, exist_ok=True)
+                tmp_path = vdata_dir / f".staging.{new_id()}{TMP_SUFFIX}"
+            else:
+                data_path = self._objects_data_dir(bucket) / h
+                tmp_path = data_path.with_name(data_path.name + TMP_SUFFIX)
             digest = hashlib.sha256()
             try:
                 with open(tmp_path, "wb") as out:
@@ -416,16 +759,21 @@ class Store:
                 tmp_path.unlink(missing_ok=True)
                 raise
             try:
-                self._check_quota_locked(total - (existing.size if existing else 0))
+                if versioned:
+                    meta = self._commit_versioned_locked(
+                        bucket, bmeta, key, existing, tmp_path, total, digest.hexdigest())
+                else:
+                    self._check_quota_locked(total - (existing.size if existing else 0))
+                    os.replace(tmp_path, data_path)
+                    meta = ObjectMeta(key=key, size=total, etag=digest.hexdigest(),
+                                      version=(existing.version + 1) if existing else 1)
+                    if existing:
+                        meta.created_at = existing.created_at
+                    _atomic_write_json(self._objects_dir(bucket) / f"{h}.json",
+                                       meta.to_dict())
             except BaseException:
                 tmp_path.unlink(missing_ok=True)
                 raise
-            os.replace(tmp_path, data_path)
-            meta = ObjectMeta(key=key, size=total, etag=digest.hexdigest(),
-                              version=(existing.version + 1) if existing else 1)
-            if existing:
-                meta.created_at = existing.created_at
-            _atomic_write_json(self._objects_dir(bucket) / f"{h}.json", meta.to_dict())
             # object committed; now remove upload state
             self._remove_upload_locked(bucket, upload_id)
             return meta

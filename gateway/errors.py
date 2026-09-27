@@ -40,6 +40,14 @@ class NoSuchUpload(GatewayError):
     status = 404
 
 
+class NoSuchVersion(GatewayError):
+    """The key exists (or once existed) but the requested version id is
+    unknown or has been evicted by the retention policy."""
+
+    code = "NoSuchVersion"
+    status = 404
+
+
 # --- 403 family -----------------------------------------------------------
 class AccessDenied(GatewayError):
     code = "AccessDenied"

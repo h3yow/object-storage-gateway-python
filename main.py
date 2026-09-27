@@ -41,8 +41,40 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # -- buckets -------------------------------------------------------------
     @app.put("/buckets/{bucket}")
     def create_bucket(bucket: str, request: Request, body: dict | None = None):
-        meta = service.create_bucket(identity(request), bucket,
-                                     policy=(body or {}).get("policy"))
+        body = body or {}
+
+        def _int(name: str) -> int:
+            try:
+                return int(body.get(name, 0) or 0)
+            except (TypeError, ValueError):
+                from gateway.errors import InvalidRequest
+                raise InvalidRequest(f"{name} must be an integer")
+
+        meta = service.create_bucket(
+            identity(request), bucket, policy=body.get("policy"),
+            versioning_enabled=bool(body.get("versioning_enabled", False)),
+            max_versions=_int("max_versions"),
+            max_version_bytes=_int("max_version_bytes"))
+        return {"bucket": meta.to_dict()}
+
+    @app.put("/buckets/{bucket}/versioning")
+    def set_versioning(bucket: str, request: Request, body: dict):
+        body = body or {}
+
+        def _opt_int(name: str):
+            if name not in body or body[name] is None:
+                return None
+            try:
+                return int(body[name])
+            except (TypeError, ValueError):
+                from gateway.errors import InvalidRequest
+                raise InvalidRequest(f"{name} must be an integer")
+
+        meta = service.set_versioning(
+            identity(request), bucket,
+            enabled=body.get("enabled"),
+            max_versions=_opt_int("max_versions"),
+            max_version_bytes=_opt_int("max_version_bytes"))
         return {"bucket": meta.to_dict()}
 
     @app.get("/buckets")
@@ -81,6 +113,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return StreamingResponse(stream, media_type="application/octet-stream",
                                  headers={"X-ETag": meta.etag,
                                           "X-Version": str(meta.version),
+                                          "X-Version-Id": meta.version_id,
                                           "Content-Length": str(meta.size)})
 
     @app.head("/buckets/{bucket}/objects/{key:path}")
@@ -89,6 +122,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(status_code=200, content=None,
                             headers={"X-ETag": meta.etag,
                                      "X-Version": str(meta.version),
+                                     "X-Version-Id": meta.version_id,
                                      "Content-Length": str(meta.size)})
 
     @app.get("/buckets/{bucket}/objects")
@@ -106,6 +140,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def delete_object(bucket: str, key: str, request: Request):
         meta = service.delete_object(identity(request), bucket, key)
         return {"deleted": key, "version": meta.version}
+
+    # -- historical versions ----------------------------------------------------
+    # Note: these live under /versions/<key> rather than a suffix because the
+    # object route uses a greedy {key:path} converter.
+    @app.get("/buckets/{bucket}/versions/{key:path}")
+    def list_versions(bucket: str, key: str, request: Request):
+        return {"versions": service.list_versions(identity(request), bucket, key)}
+
+    @app.get("/buckets/{bucket}/version/{version_id}/{key:path}")
+    def get_version(bucket: str, key: str, version_id: str, request: Request):
+        vmeta, stream = service.read_version(identity(request), bucket, key, version_id)
+        return StreamingResponse(stream, media_type="application/octet-stream",
+                                 headers={"X-ETag": vmeta.etag,
+                                          "X-Version": str(vmeta.version),
+                                          "X-Version-Id": vmeta.version_id,
+                                          "Content-Length": str(vmeta.size)})
+
+    @app.post("/buckets/{bucket}/version/{version_id}/{key:path}/rollback")
+    def rollback_version(bucket: str, key: str, version_id: str, request: Request,
+                         if_version: int | None = Query(default=None),
+                         if_absent: bool = Query(default=False)):
+        meta = service.rollback_version(identity(request), bucket, key, version_id,
+                                        if_version=if_version, if_absent=if_absent)
+        return {"object": meta.to_dict()}
 
     # -- multipart uploads -------------------------------------------------------
     @app.post("/buckets/{bucket}/uploads")

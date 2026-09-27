@@ -64,3 +64,21 @@ def test_policy_management_owner_only(client):
     print("[case] unknown policy action rejected")
     r = client.put("/buckets/b/policy", headers=ALICE, json={"policy": {"fly": ["*"]}})
     assert r.status_code == 400 and r.json()["error"]["code"] == "InvalidRequest"
+
+
+def test_version_endpoints_authorisation(client):
+    client.put("/buckets/b", headers=ALICE, json={"versioning_enabled": True})
+    client.put("/buckets/b/objects/k", headers=ALICE, content=b"v1")
+    client.put("/buckets/b/objects/k", headers=ALICE, content=b"v2")
+    vid = client.get("/buckets/b/versions/k", headers=ALICE).json()["versions"][-1]["version_id"]
+    print("\n[authz] bob has no grants: version list/read/rollback all 403")
+    assert client.get("/buckets/b/versions/k", headers=BOB).status_code == 403
+    assert client.get(f"/buckets/b/version/{vid}/k", headers=BOB).status_code == 403
+    r = client.post(f"/buckets/b/version/{vid}/k/rollback", headers=BOB)
+    assert r.status_code == 403
+    print("[authz] read grant covers list + version read; rollback still needs write")
+    client.put("/buckets/b/policy", headers=ALICE, json={"policy": {"read": ["bob"]}})
+    assert client.get("/buckets/b/versions/k", headers=BOB).status_code == 200
+    assert client.get(f"/buckets/b/version/{vid}/k", headers=BOB).status_code == 200
+    r = client.post(f"/buckets/b/version/{vid}/k/rollback", headers=BOB)
+    assert r.status_code == 403

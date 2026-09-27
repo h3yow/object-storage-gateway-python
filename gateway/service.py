@@ -13,8 +13,8 @@ from __future__ import annotations
 from typing import Iterator
 
 from . import auth
-from .errors import AccessDenied, NoSuchBucket
-from .models import BucketMeta, ObjectMeta, PartMeta, UploadMeta
+from .errors import AccessDenied, InvalidRequest, NoSuchBucket
+from .models import BucketMeta, ObjectMeta, PartMeta, UploadMeta, VersionMeta
 from .store import Store
 
 
@@ -35,13 +35,51 @@ class GatewayService:
         return bucket
 
     # -- buckets -------------------------------------------------------------
-    def create_bucket(self, identity: str, name: str, policy: dict | None = None) -> BucketMeta:
+    def create_bucket(self, identity: str, name: str, policy: dict | None = None,
+                      versioning_enabled: bool = False,
+                      max_versions: int = 0,
+                      max_version_bytes: int = 0) -> BucketMeta:
         if not name or "/" in name or name in (".", ".."):
-            from .errors import InvalidRequest
             raise InvalidRequest(f"invalid bucket name: {name!r}")
-        meta = BucketMeta(name=name, owner=identity, policy=policy or {})
+        self._validate_retention(max_versions, max_version_bytes)
+        meta = BucketMeta(name=name, owner=identity, policy=policy or {},
+                          versioning_enabled=versioning_enabled,
+                          max_versions=max_versions,
+                          max_version_bytes=max_version_bytes)
         self.store.create_bucket(meta)
         return meta
+
+    @staticmethod
+    def _validate_retention(max_versions: int, max_version_bytes: int) -> None:
+        if not isinstance(max_versions, int) or max_versions < 0:
+            raise InvalidRequest("max_versions must be a non-negative integer")
+        if not isinstance(max_version_bytes, int) or max_version_bytes < 0:
+            raise InvalidRequest("max_version_bytes must be a non-negative integer")
+        if max_versions == 1:
+            raise InvalidRequest(
+                "max_versions=1 would evict every old version immediately; "
+                "use 0 (unlimited) or a value >= 2, or disable versioning")
+
+    def set_versioning(self, identity: str, name: str, *,
+                       enabled: bool | None = None,
+                       max_versions: int | None = None,
+                       max_version_bytes: int | None = None) -> BucketMeta:
+        """Enable/disable historical retention and adjust its limits.
+        Only the owner may change it. Disabling keeps already-kept versions
+        readable; only subsequent overwrites stop preserving history."""
+        bucket = self._bucket_or_404(name)
+        if bucket.owner != identity:
+            raise AccessDenied("only the bucket owner may change versioning")
+        if enabled is not None:
+            bucket.versioning_enabled = bool(enabled)
+        if max_versions is not None:
+            self._validate_retention(max_versions, bucket.max_version_bytes)
+            bucket.max_versions = max_versions
+        if max_version_bytes is not None:
+            self._validate_retention(bucket.max_versions, max_version_bytes)
+            bucket.max_version_bytes = max_version_bytes
+        self.store.update_bucket(bucket)
+        return bucket
 
     def list_buckets(self, identity: str) -> list[BucketMeta]:
         return [b for b in self.store.list_buckets()
@@ -95,6 +133,57 @@ class GatewayService:
     def delete_object(self, identity: str, bucket: str, key: str) -> ObjectMeta:
         self._authorize(bucket, identity, "delete")
         return self.store.delete_object(bucket, key)
+
+    # -- historical versions ---------------------------------------------------
+    def list_versions(self, identity: str, bucket: str, key: str) -> list[dict]:
+        """All versions of the key, newest first, each flagged as current."""
+        self._authorize(bucket, identity, "read")
+        current = self.store.get_object_meta(bucket, key)
+        if current is None:
+            from .errors import NoSuchKey
+            raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
+        versions = self.store.list_versions(bucket, key)
+        out = []
+        if not versions and not current.version_id:
+            # legacy current: versioning never archived it, but the current
+            # content is still a listable/readable "version".
+            out.append(self._version_view(VersionMeta(
+                key=current.key, version=current.version, version_id="",
+                size=current.size, etag=current.etag,
+                created_at=current.updated_at), current, legacy=True))
+        for v in reversed(versions):
+            out.append(self._version_view(v, current))
+        return out
+
+    @staticmethod
+    def _version_view(v: VersionMeta, current: ObjectMeta, legacy: bool = False) -> dict:
+        d = v.to_dict()
+        d["is_current"] = legacy or (v.version_id == current.version_id)
+        d["current_version"] = current.version
+        return d
+
+    def read_version(self, identity: str, bucket: str, key: str, version_id: str):
+        self._authorize(bucket, identity, "read")
+        current = self.store.get_object_meta(bucket, key)
+        if current is None:
+            from .errors import NoSuchKey
+            raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
+        # open + metadata are resolved under one bucket lock in the store,
+        # so the returned header and body are the same immutable version.
+        return self.store.read_version_stream(bucket, key, version_id)
+
+    def rollback_version(self, identity: str, bucket: str, key: str,
+                         version_id: str, if_version: int | None = None,
+                         if_absent: bool = False) -> ObjectMeta:
+        """Re-submit a historical version as a new current write. Requires
+        write permission and goes through the normal conditional checks;
+        history is never mutated."""
+        bmeta = self._authorize(bucket, identity, "write")
+        if not bmeta.versioning_enabled:
+            raise InvalidRequest(
+                "cannot roll back in a bucket with versioning disabled")
+        return self.store.promote_version(bucket, bmeta, key, version_id,
+                                          if_version=if_version, if_absent=if_absent)
 
     # -- multipart -------------------------------------------------------------
     def create_upload(self, identity: str, bucket: str, key: str) -> UploadMeta:

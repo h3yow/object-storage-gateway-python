@@ -24,13 +24,25 @@ class BucketMeta:
     # Bucket policy: {action: [identity, ...]}; "*" matches any identity.
     # Actions: read, write, list, delete.
     policy: dict = field(default_factory=dict)
+    # When True, overwrites/merges preserve the previous content as a
+    # read-only historical version instead of destroying it.
+    versioning_enabled: bool = False
+    # Retention limits for historical versions, per key. 0 = unlimited.
+    # Oldest non-current versions are evicted first; the current version is
+    # never evicted.
+    max_versions: int = 0        # keep at most this many versions per key
+    max_version_bytes: int = 0   # cap total bytes of kept versions per key
 
     def to_dict(self) -> dict:
         return asdict(self)
 
     @classmethod
     def from_dict(cls, d: dict) -> "BucketMeta":
-        return cls(name=d["name"], owner=d["owner"], created_at=d["created_at"], policy=d.get("policy", {}))
+        return cls(name=d["name"], owner=d["owner"],
+                   created_at=d["created_at"], policy=d.get("policy", {}),
+                   versioning_enabled=d.get("versioning_enabled", False),
+                   max_versions=d.get("max_versions", 0),
+                   max_version_bytes=d.get("max_version_bytes", 0))
 
 
 @dataclass
@@ -41,6 +53,9 @@ class ObjectMeta:
     version: int = 1            # bumped on every committed overwrite
     created_at: float = field(default_factory=_now)
     updated_at: float = field(default_factory=_now)
+    # Stable identifier of the current content. Empty for legacy objects
+    # written before versioning existed (their data lives at the legacy path).
+    version_id: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -48,7 +63,27 @@ class ObjectMeta:
     @classmethod
     def from_dict(cls, d: dict) -> "ObjectMeta":
         return cls(key=d["key"], size=d["size"], etag=d["etag"],
-                   version=d.get("version", 1), created_at=d["created_at"], updated_at=d["updated_at"])
+                   version=d.get("version", 1), created_at=d["created_at"],
+                   updated_at=d["updated_at"], version_id=d.get("version_id", ""))
+
+
+@dataclass
+class VersionMeta:
+    """One immutable historical version of a key."""
+    key: str
+    version: int                # 1-based sequence number within the key
+    version_id: str             # stable, re-referenceable identifier
+    size: int
+    etag: str
+    created_at: float           # when this content became current
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "VersionMeta":
+        return cls(key=d["key"], version=d["version"], version_id=d["version_id"],
+                   size=d["size"], etag=d["etag"], created_at=d["created_at"])
 
 
 @dataclass
