@@ -44,6 +44,7 @@ class GatewayService:
         self._validate_retention(max_versions, max_version_bytes)
         meta = BucketMeta(name=name, owner=identity, policy=policy or {},
                           versioning_enabled=versioning_enabled,
+                          versioning_ever_enabled=versioning_enabled,
                           max_versions=max_versions,
                           max_version_bytes=max_version_bytes)
         self.store.create_bucket(meta)
@@ -66,10 +67,12 @@ class GatewayService:
                        max_version_bytes: int | None = None) -> BucketMeta:
         """Enable/disable historical retention and adjust its limits.
         Only the owner may change it. Disabling keeps already-kept versions
-        readable; only subsequent overwrites stop preserving history."""
+        readable (they are frozen and survive later overwrites); enabling
+        immediately gives pre-existing objects stable version ids."""
         bucket = self._bucket_or_404(name)
         if bucket.owner != identity:
             raise AccessDenied("only the bucket owner may change versioning")
+        previous_enabled = bucket.versioning_enabled
         if enabled is not None:
             bucket.versioning_enabled = bool(enabled)
         if max_versions is not None:
@@ -78,7 +81,10 @@ class GatewayService:
         if max_version_bytes is not None:
             self._validate_retention(bucket.max_versions, max_version_bytes)
             bucket.max_version_bytes = max_version_bytes
-        self.store.update_bucket(bucket)
+        if enabled is not None and bool(enabled) != previous_enabled:
+            self.store.set_versioning_config(bucket, previous_enabled)
+        else:
+            self.store.update_bucket(bucket)
         return bucket
 
     def list_buckets(self, identity: str) -> list[BucketMeta]:
@@ -122,8 +128,15 @@ class GatewayService:
         return meta
 
     def read_object(self, identity: str, bucket: str, key: str) -> tuple[ObjectMeta, Iterator[bytes]]:
-        meta = self.get_object_meta(identity, bucket, key)
-        return meta, self.store.read_object_stream(bucket, key)
+        self._authorize(bucket, identity, "read")
+        # Header meta and body are resolved in one locked critical section in
+        # the store, so a racing overwrite cannot make the returned
+        # size/etag/version_id describe a different version than the body.
+        meta, stream = self.store.read_object_stream(bucket, key)
+        if meta is None:
+            from .errors import NoSuchKey
+            raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
+        return meta, stream
 
     def list_objects(self, identity: str, bucket: str, prefix: str = "",
                      marker: str = "", limit: int | None = None):
@@ -136,17 +149,25 @@ class GatewayService:
 
     # -- historical versions ---------------------------------------------------
     def list_versions(self, identity: str, bucket: str, key: str) -> list[dict]:
-        """All versions of the key, newest first, each flagged as current."""
+        """All versions of the key, newest first, each flagged as current.
+
+        The current version is *always* present and carries a stable,
+        re-referenceable id once the bucket has ever had versioning enabled,
+        whether retention is currently on or off. In a bucket that never had
+        versioning on, the single entry is the legacy current with an empty
+        version id (existing behaviour). The snapshot is read atomically in
+        the store, so a concurrent overwrite cannot mix list metadata with a
+        different content generation."""
         self._authorize(bucket, identity, "read")
-        current = self.store.get_object_meta(bucket, key)
+        current, versions = self.store.get_version_snapshot(bucket, key)
         if current is None:
             from .errors import NoSuchKey
             raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
-        versions = self.store.list_versions(bucket, key)
         out = []
-        if not versions and not current.version_id:
-            # legacy current: versioning never archived it, but the current
-            # content is still a listable/readable "version".
+        if not current.version_id:
+            # legacy current: a bucket that never had versioning enabled (or
+            # a crash left an unmigrated body) -- still listable, just with
+            # no stable id, exactly as before.
             out.append(self._version_view(VersionMeta(
                 key=current.key, version=current.version, version_id="",
                 size=current.size, etag=current.etag,

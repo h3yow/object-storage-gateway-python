@@ -223,6 +223,26 @@ class Store:
                 raise NoSuchBucket(f"bucket '{meta.name}' does not exist")
             _atomic_write_json(self._bucket_meta_path(meta.name), meta.to_dict())
 
+    def set_versioning_config(self, meta: BucketMeta, previous_enabled: bool) -> None:
+        """Persist a new versioning configuration together with the on-disk
+        effects of the transition, all under one bucket lock:
+
+          * enabling (first time or re-enabling): existing legacy currents
+            are promoted into version storage and gain a stable version id;
+            the sticky ``versioning_ever_enabled`` latch is set;
+          * disabling: every retained version is frozen so subsequent
+            overwrites cannot remove it.
+        """
+        with self._global_lock, self._bucket_lock(meta.name):
+            if not self._bucket_meta_path(meta.name).exists():
+                raise NoSuchBucket(f"bucket '{meta.name}' does not exist")
+            if meta.versioning_enabled and not previous_enabled:
+                meta.versioning_ever_enabled = True
+                self.enable_versioning_locked(meta.name)
+            elif not meta.versioning_enabled and previous_enabled:
+                self.disable_versioning_locked(meta.name)
+            _atomic_write_json(self._bucket_meta_path(meta.name), meta.to_dict())
+
     def list_buckets(self) -> list[BucketMeta]:
         buckets_dir = self.root / "buckets"
         out = []
@@ -299,12 +319,24 @@ class Store:
         with self._bucket_lock(bucket):
             return self._list_version_metas_locked(bucket, key)
 
+    def get_version_snapshot(self, bucket: str, key: str) -> tuple[ObjectMeta | None, list[VersionMeta]]:
+        """Atomically read the current ObjectMeta together with all stored
+        versions of the key (oldest first), so the listing can never mix
+        pre- and post-overwrite states."""
+        with self._bucket_lock(bucket):
+            current = self.get_object_meta(bucket, key)
+            versions = self._list_version_metas_locked(bucket, key)
+            return current, versions
+
     def _eviction_plan_locked(self, bucket: BucketMeta,
                               versions: list[VersionMeta],
                               current_vid: str) -> list[VersionMeta]:
-        """Oldest non-current versions are evicted first. The current version
-        is never part of the plan. Both limits apply independently."""
-        history = [v for v in versions if v.version_id != current_vid]
+        """Oldest non-current, non-frozen versions are evicted first. The
+        current version and frozen versions (history retained from a period
+        when versioning was disabled) are never part of the plan. Both
+        limits apply independently."""
+        history = [v for v in versions
+                   if v.version_id != current_vid and not v.frozen]
         history.sort(key=lambda v: (v.version, v.created_at))
         keep_count = bucket.max_versions - 1 if bucket.max_versions else len(history)
         keep_bytes = bucket.max_version_bytes
@@ -357,23 +389,111 @@ class Store:
         # this point simply leaves it for recover() to reap)
         (self._objects_data_dir(bucket) / _key_hash(key)).unlink(missing_ok=True)
 
+    def _promote_legacy_current_locked(self, bucket: str, key: str,
+                                       meta: ObjectMeta) -> ObjectMeta:
+        """Give a legacy current (empty version_id, body in objects-data/) a
+        stable version id by moving its body into version storage and
+        recording a VersionMeta. Returns the updated ObjectMeta.
+
+        Crash-safe and idempotent: a retry adopts a half-finished migration
+        (a same-content VersionMeta left behind by a crash) instead of
+        failing on the already-removed legacy source. A legacy current can
+        only exist before versioning first touched the key, so any matching
+        VersionMeta found here must be such a leftover."""
+        if meta.version_id:
+            return meta
+        self._versions_dir(bucket, key).mkdir(parents=True, exist_ok=True)
+        vdata_dir = self._versions_data_dir(bucket, key)
+        vdata_dir.mkdir(parents=True, exist_ok=True)
+        vid = ""
+        for v in self._list_version_metas_locked(bucket, key):
+            if (v.size == meta.size and v.etag == meta.etag
+                    and self._version_data_path(bucket, key, v.version_id).exists()):
+                vid = v.version_id
+                break
+        if not vid:
+            vid = new_id()
+            target_data = self._version_data_path(bucket, key, vid)
+            tmp = target_data.with_name(target_data.name + TMP_SUFFIX)
+            src = self._objects_data_dir(bucket) / _key_hash(key)
+            with open(src, "rb") as fin, open(tmp, "wb") as fout:
+                while True:
+                    buf = fin.read(self.settings.stream_chunk_size)
+                    if not buf:
+                        break
+                    fout.write(buf)
+                fout.flush()
+                os.fsync(fout.fileno())
+            os.replace(tmp, target_data)
+        vmeta = VersionMeta(key=key, version=meta.version, version_id=vid,
+                            size=meta.size, etag=meta.etag,
+                            created_at=meta.updated_at)
+        _atomic_write_json(self._version_meta_path(bucket, key, vid), vmeta.to_dict())
+        meta.version_id = vid
+        _atomic_write_json(self._objects_dir(bucket) / f"{_key_hash(key)}.json",
+                           meta.to_dict())
+        (self._objects_data_dir(bucket) / _key_hash(key)).unlink(missing_ok=True)
+        return meta
+
+    def enable_versioning_locked(self, bucket: str) -> None:
+        """Versioning was just switched on: every existing legacy current
+        gets a stable, re-referenceable version id immediately, so listing
+        and id-based reads work without waiting for the next overwrite.
+        Caller holds the bucket lock."""
+        for mp in self._objects_dir(bucket).glob("*.json"):
+            meta = ObjectMeta.from_dict(_read_json(mp))
+            if not meta.version_id:
+                self._promote_legacy_current_locked(bucket, meta.key, meta)
+
+    def disable_versioning_locked(self, bucket: str) -> None:
+        """Versioning was just switched off: freeze every retained version so
+        it survives subsequent overwrites (retention limits no longer apply
+        while versioning is disabled). Caller holds the bucket lock."""
+        versions_root = self._bucket_dir(bucket) / "versions"
+        if not versions_root.exists():
+            return
+        for vpath in versions_root.glob("*/*.json"):
+            v = VersionMeta.from_dict(_read_json(vpath))
+            if not v.frozen:
+                v.frozen = True
+                _atomic_write_json(vpath, v.to_dict())
+
     def _commit_versioned_locked(self, bucket: str, bmeta: BucketMeta, key: str,
                                  existing: ObjectMeta | None,
                                  tmp_path: Path, size: int, etag: str) -> ObjectMeta:
         """Promote a fully-staged tmp body to a new current version, archive
         the previous current, enforce retention and quota. Caller holds the
-        global + bucket locks and has validated write preconditions."""
+        global + bucket locks and has validated write preconditions.
+
+        Two modes, chosen by ``bmeta.versioning_enabled``:
+          * enabled: the previous current becomes a retained *historical*
+            version and the retention policy evicts old non-frozen versions;
+          * disabled (in a bucket that once had versioning on): the previous
+            current is *frozen* and kept indefinitely, no eviction runs, and
+            the new body still gets a stable version id so the current
+            version remains listable and readable by id.
+        """
+        enabled = bmeta.versioning_enabled
         versions = self._list_version_metas_locked(bucket, key)
         new_vid = new_id()
         new_version = (existing.version + 1) if existing else 1
-        evict = self._eviction_plan_locked(
-            bmeta, versions + [VersionMeta(
-                key=key, version=new_version, version_id=new_vid,
-                size=size, etag=etag, created_at=0.0)],
-            current_vid=new_vid)
+        evict: list[VersionMeta] = []
+        if enabled:
+            evict = self._eviction_plan_locked(
+                bmeta, versions + [VersionMeta(
+                    key=key, version=new_version, version_id=new_vid,
+                    size=size, etag=etag, created_at=0.0)],
+                current_vid=new_vid)
         # quota: new body added, planned evictions release space; the old
-        # current stays counted (it becomes a retained historical version).
+        # current stays counted (it becomes a retained/frozen version).
         self._check_quota_locked(size - sum(v.size for v in evict))
+        if existing is not None and existing.version_id:
+            old_path = self._version_meta_path(bucket, key, existing.version_id)
+            old_vmeta = VersionMeta.from_dict(_read_json(old_path))
+            if not enabled and not old_vmeta.frozen:
+                old_vmeta.frozen = True
+                _atomic_write_json(old_path, old_vmeta.to_dict())
+        # a legacy current (possible on the first versioned write) is migrated
         if existing is not None:
             self._archive_current_locked(bucket, key, existing)
         self._versions_dir(bucket, key).mkdir(parents=True, exist_ok=True)
@@ -529,7 +649,7 @@ class Store:
                     raise PreconditionFailed(
                         f"expected version {if_version}, current version is {current}")
             h = _key_hash(key)
-            if bmeta is not None and bmeta.versioning_enabled:
+            if bmeta is not None and bmeta.versioning_ever_enabled:
                 vdata_dir = self._versions_data_dir(bucket, key)
                 vdata_dir.mkdir(parents=True, exist_ok=True)
                 tmp_path = vdata_dir / f".staging.{new_id()}{TMP_SUFFIX}"
@@ -556,22 +676,35 @@ class Store:
             _atomic_write_json(self._objects_dir(bucket) / f"{h}.json", meta.to_dict())
             return meta
 
-    def read_object_stream(self, bucket: str, key: str) -> Iterator[bytes]:
-        """Yield the *current* object's bytes in bounded chunks.
+    def open_current_object(self, bucket: str, key: str):
+        """Resolve the current meta *and* open its body under one bucket lock.
 
-        The current version is located and its file opened under the bucket
-        lock; afterwards streaming runs lock-free but against a fixed inode.
-        An overwrite (rename) or eviction (unlink) racing with the read cannot
-        change the open file, so length/etag header and body are guaranteed
-        to describe the same version."""
-        meta = self.get_object_meta(bucket, key)
+        The returned header (size/etag/version_id) and file handle therefore
+        always describe the same content. Streaming afterwards runs lock-free
+        against a fixed inode: a racing overwrite (rename) or eviction/delete
+        (unlink) can neither swap the body out from under the reader nor
+        delete the data mid-read (POSIX keeps an unlinked/renamed inode alive
+        for open handles). Returns (None, None) if the key does not exist."""
+        with self._bucket_lock(bucket):
+            meta = self.get_object_meta(bucket, key)
+            if meta is None:
+                return None, None
+            if meta.version_id:
+                f = open(self._version_data_path(bucket, key, meta.version_id), "rb")  # noqa: SIM115
+                return meta, f
+            f = open(self._objects_data_dir(bucket) / _key_hash(key), "rb")  # noqa: SIM115
+            return meta, f
+
+    def read_object_stream(self, bucket: str, key: str) -> tuple[ObjectMeta, Iterator[bytes]]:
+        """Open the *current* object self-consistently and stream it in
+        bounded chunks. See open_current_object for the consistency
+        guarantee."""
+        meta, f = self.open_current_object(bucket, key)
         if meta is None:
             raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
-        if meta.version_id:
-            _, f = self.open_version_data(bucket, key, meta.version_id)
-            if f is None:  # current meta without body: impossible post-recover
-                raise NoSuchKey(f"object '{key}' is unavailable in bucket '{bucket}'")
-            chunk = self.settings.stream_chunk_size
+        chunk = self.settings.stream_chunk_size
+
+        def _gen():
             try:
                 while True:
                     buf = f.read(chunk)
@@ -580,15 +713,8 @@ class Store:
                     yield buf
             finally:
                 f.close()
-            return
-        data_path = self._objects_data_dir(bucket) / _key_hash(key)
-        chunk = self.settings.stream_chunk_size
-        with open(data_path, "rb") as f:
-            while True:
-                buf = f.read(chunk)
-                if not buf:
-                    break
-                yield buf
+
+        return meta, _gen()
 
     def read_version_stream(self, bucket: str, key: str,
                             version_id: str) -> tuple[VersionMeta, Iterator[bytes]]:
@@ -732,7 +858,7 @@ class Store:
                     raise PreconditionFailed(
                         f"expected version {if_version}, current version is {current}")
             h = _key_hash(key)
-            versioned = bmeta is not None and bmeta.versioning_enabled
+            versioned = bmeta is not None and bmeta.versioning_ever_enabled
             if versioned:
                 vdata_dir = self._versions_data_dir(bucket, key)
                 vdata_dir.mkdir(parents=True, exist_ok=True)

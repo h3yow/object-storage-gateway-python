@@ -307,9 +307,10 @@ def test_disable_then_overwrite_and_delete_leaves_no_residue(client, settings):
     _put(client, "k", b"v2")
     print("\n[case] disable versioning, overwrite (frozen history), then delete")
     client.put("/buckets/b/versioning", headers=ALICE, json={"enabled": False})
-    _put(client, "k", b"v3-legacy")  # goes back to the legacy data location
+    _put(client, "k", b"v3-legacy")  # stays in version storage, but with history frozen
     svc = client.app.state.service
     before = svc.store.usage_bytes()
+    # v1 + v2 frozen history plus the new current body are all retained
     assert before == len(b"v3-legacy") + len(b"v1") + len(b"v2")
     r = client.delete("/buckets/b/objects/k", headers=ALICE)
     assert r.status_code == 200
@@ -324,3 +325,129 @@ def test_disable_then_overwrite_and_delete_leaves_no_residue(client, settings):
     c2, report = TestClient(create_app(settings)), None
     report = c2.app.state.recovery_report
     assert report["orphan_data_removed"] == 0
+
+
+def test_current_read_self_consistent_under_concurrent_overwrite(client):
+    """Reading the *current* object while writers overwrite it must always
+    return length/etag headers describing exactly the returned body -- even
+    on a bucket that never had versioning enabled (legacy data path)."""
+    import hashlib
+    import time
+    client.put("/buckets/b", headers=ALICE)  # versioning stays OFF
+    client.put("/buckets/b/objects/hot", headers=ALICE, content=b"x" * 200_000)
+    stop = threading.Event()
+    errors = []
+
+    def writer(i):
+        j = 0
+        while not stop.is_set():
+            try:
+                client.put("/buckets/b/objects/hot", headers=ALICE,
+                           content=f"w{i}-{j:05d}-".encode() + bytes([65 + j % 26]) * 300_000)
+            except Exception as e:  # noqa: BLE001
+                errors.append(e)
+            j += 1
+
+    def reader():
+        deadline = time.time() + 1.5
+        while time.time() < deadline:
+            r = client.get("/buckets/b/objects/hot", headers=ALICE)
+            if r.status_code != 200:
+                errors.append(AssertionError(f"read {r.status_code}"))
+                return
+            body = r.content
+            if int(r.headers["Content-Length"]) != len(body):
+                errors.append(AssertionError("length/header mismatch"))
+            if hashlib.sha256(body).hexdigest() != r.headers["X-ETag"]:
+                errors.append(AssertionError("etag/body mismatch"))
+
+    threads = [threading.Thread(target=writer, args=(i,)) for i in range(2)]
+    threads += [threading.Thread(target=reader) for _ in range(2)]
+    for t in threads:
+        t.start()
+    time.sleep(2.0)
+    stop.set()
+    for t in threads:
+        t.join()
+    print("\n[case] current reads racing overwrites: header and body always matched")
+    assert not errors, errors[:3]
+
+
+def test_enabling_versioning_gives_current_a_stable_id(client):
+    """After enabling retention on a bucket that already holds objects, the
+    listed current version carries a stable id and that id reads the current
+    content back -- no overwrite needed first."""
+    client.put("/buckets/b", headers=ALICE)
+    _put(client, "k", b"already-here")
+    print("\n[case] enable on populated bucket: current is immediately id-addressable")
+    _enable(client, enabled=True)
+    o = client.get("/buckets/b/objects/k", headers=ALICE)
+    assert o.headers["X-Version-Id"]
+    vs = _versions(client, "k")
+    assert len(vs) == 1
+    cur = vs[0]
+    assert cur["is_current"] and cur["version_id"] == o.headers["X-Version-Id"]
+    r = client.get(f"/buckets/b/version/{cur['version_id']}/k", headers=ALICE)
+    assert r.status_code == 200 and r.content == b"already-here"
+    # the id survives a subsequent overwrite (it then denotes version 1)
+    _put(client, "k", b"next")
+    r = client.get(f"/buckets/b/version/{cur['version_id']}/k", headers=ALICE)
+    assert r.status_code == 200 and r.content == b"already-here"
+    vs = _versions(client, "k")
+    assert [(v["version"], v["is_current"]) for v in vs] == [(2, True), (1, False)]
+
+
+def test_disabling_versioning_keeps_current_listed_and_readable(client):
+    """Version list always contains the current version, whether retention
+    is on or was just turned off; overwrites while disabled freeze prior
+    versions instead of dropping them."""
+    _enable(client, enabled=True)
+    _put(client, "k", b"v1")
+    _put(client, "k", b"v2")
+    print("\n[case] disable then overwrite: current stays listed + readable by id")
+    client.put("/buckets/b/versioning", headers=ALICE, json={"enabled": False})
+    o3 = _put(client, "k", b"v3-disabled")
+    assert o3["version_id"]
+    vs = _versions(client, "k")
+    assert [(v["version"], v["is_current"]) for v in vs] == [
+        (3, True), (2, False), (1, False)]
+    cur = vs[0]
+    assert cur["version_id"] == o3["version_id"]
+    assert client.get("/buckets/b/objects/k", headers=ALICE).content == b"v3-disabled"
+    r = client.get(f"/buckets/b/version/{cur['version_id']}/k", headers=ALICE)
+    assert r.status_code == 200 and r.content == b"v3-disabled"
+    # older versions were frozen and remain readable
+    for v, body in ((vs[1], b"v2"), (vs[2], b"v1")):
+        assert v["frozen"] is True
+        r = client.get(f"/buckets/b/version/{v['version_id']}/k", headers=ALICE)
+        assert r.status_code == 200 and r.content == body
+    # a further overwrite while disabled keeps the previous current readable
+    o4 = _put(client, "k", b"v4-disabled")
+    assert client.get(f"/buckets/b/version/{o3['version_id']}/k",
+                      headers=ALICE).content == b"v3-disabled"
+    assert client.get(f"/buckets/b/version/{o4['version_id']}/k",
+                      headers=ALICE).content == b"v4-disabled"
+    vs = _versions(client, "k")
+    assert [(v["version"], v["is_current"]) for v in vs] == [
+        (4, True), (3, False), (2, False), (1, False)]
+
+
+def test_evicted_and_unknown_ids_are_distinguishable_not_found(client):
+    """Both an id evicted by retention and a fabricated id read as
+    NoSuchVersion; a missing key still reads as NoSuchKey. The current id is
+    never 'not found'."""
+    _enable(client, enabled=True, max_versions=2)
+    for i in range(5):
+        _put(client, "k", f"body{i}".encode())
+    vs = _versions(client, "k")
+    print("\n[case] current id readable; evicted + fabricated ids -> NoSuchVersion")
+    r = client.get(f"/buckets/b/version/{vs[0]['version_id']}/k", headers=ALICE)
+    assert r.status_code == 200
+    r = client.get(f"/buckets/b/version/{'ab'*16}/k", headers=ALICE)
+    assert r.status_code == 404 and r.json()["error"]["code"] == "NoSuchVersion"
+    # key that never existed is a different 404
+    r = client.get(f"/buckets/b/version/{'ab'*16}/missing", headers=ALICE)
+    assert r.status_code == 404 and r.json()["error"]["code"] == "NoSuchKey"
+    # listing on a missing key is also NoSuchKey
+    r = client.get("/buckets/b/versions/missing", headers=ALICE)
+    assert r.status_code == 404 and r.json()["error"]["code"] == "NoSuchKey"

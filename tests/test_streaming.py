@@ -20,7 +20,8 @@ def test_read_write_streamed_in_bounded_chunks(tmp_path):
     print("  round-trip intact; server-side read path yields <= chunk_size buffers")
     # verify the store read path really chunks
     store = client.app.state.service.store
-    chunks = list(store.read_object_stream("b", "s"))
+    _, stream = store.read_object_stream("b", "s")
+    chunks = list(stream)
     print(f"  chunks yielded: {len(chunks)}, max chunk: {max(len(c) for c in chunks)}")
     assert max(len(c) for c in chunks) <= settings.stream_chunk_size
     assert b"".join(chunks) == payload

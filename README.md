@@ -93,19 +93,33 @@ curl -X PUT localhost:8000/buckets/demo/versioning -H 'X-Identity: alice' \
 
 * **版本标识**：每次提交产生一个随机、全局唯一的 `version_id`（32 位十六
   进制），一旦产生永不改变、可再次引用；`version` 是键内从 1 递增的序号。
-  开启保留之前就存在的旧对象（遗留数据）会在开启后的第一次覆盖时自动迁入
-  版本存储，成为版本 1；在未开启保留的桶里该对象的 `version_id` 为空。
-* **并发自洽的读取**：读取某一版时，版本元数据与数据文件在同一把桶级锁内
-  定位并打开，之后正文以固定 inode 流式返回（POSIX 下 rename/unlink 不影响
-  已打开的句柄）。因此即使读取过程中该键正被覆盖、或该版本正被淘汰，返回
-  的长度、`etag` 与正文也必然来自同一版本；版本恰好在打开瞬间被淘汰时，得
-  到明确的 404 `NoSuchVersion`，绝不会读到半截或对不上的内容。
+  对**已经有对象**的桶开启保留时，存量对象（遗留数据）会在开启动作内立即
+  迁入版本存储并获得稳定标识——无需等下一次覆盖，开启后立刻就能在版本列表
+  中看到当前版本、并按其标识读回当前内容。在从未开启过保留的桶里对象
+  `version_id` 为空，读写行为与旧版本完全一致。
+* **读取自洽（当前对象与历史版本都适用）**：无论是读当前对象还是读某一版，
+  "解析元数据（长度/etag/version_id）"与"打开正文文件"都在同一把桶级锁内
+  作为一个快照动作完成，之后正文以固定 inode 流式返回（POSIX 下
+  rename/unlink 不影响已打开的句柄）。因此一次读取返回的长度、`etag` 与
+  正文必然来自同一份内容：读取过程中对象恰好被覆盖、旧版本恰好被淘汰、甚
+  至源数据恰好被删除，都不会出现响应头与正文对不上、或读到一半数据被删的
+  情况。版本列表同样在一把桶锁内取"当前元数据 + 全部版本"的一致性快照。
+  版本恰好在打开瞬间被淘汰时得到明确的 404 `NoSuchVersion`。
 * **回滚是新写入**：回滚不修改、不删除任何历史版本——源版本正文以硬链接
   （不支持硬链接的文件系统上退化为拷贝）复制成一个全新的当前版本，版本号
   +1，并照常走 `if_version` / `if_absent` 条件判断与桶锁串行规则。412 时
   历史版本保持不动。
-* **关闭保留**：已有历史版本继续可读（"冻结的历史"）；关闭后的新覆盖不再
-  保留旧内容。删除对象会连同冻结历史一起释放空间。
+* **关闭保留（之后仍可重新开启）**：关闭时现存的全部版本被**冻结**
+  （`frozen`），冻结版本在关闭期间继续可读、且不受任何保留上限约束——关闭
+  后的覆盖不会再移除它们；新写入的当前版本同样落在版本存储里、同样带稳定
+  标识，因此**无论保留是开着还是刚关掉，版本列表始终包含当前版本，当前版
+  本也始终能按标识读到**，旧版本则作为冻结历史保留。重新开启保留后：冻结
+  解除，版本列表中的 `frozen` 标记清零，此后的新提交重新按 `max_versions`
+  / `max_version_bytes` 对非冻结版本执行淘汰（冻结期间产生的版本解冻后也
+  一视同仁参与淘汰）。删除对象会连同冻结历史一起释放空间。
+* **从未开启过保留的桶**：维持原有读写行为（正文在 legacy 数据路径、
+  `version_id` 为空、不产生版本存储文件），不影响既有用法；用伪造标识读
+  版本仍返回 `NoSuchVersion`。
 * **删除对象**：显式 `DELETE` 会删除该键当前版本与全部历史版本（版本保留
   不是删除保护）；查询一个已删键的版本返回 `NoSuchKey`。
 * **不存在的版本**：标识从未存在、已被淘汰，查询一律返回 404
@@ -115,13 +129,14 @@ curl -X PUT localhost:8000/buckets/demo/versioning -H 'X-Identity: alice' \
 
 * `max_versions=N`：每个键至多保留 N 个版本（含当前版本）。
 * `max_version_bytes=B`：每个键**历史版本**（不含当前版本）占用字节合计上
-  限；当前版本永远不计入淘汰、永远不会被淘汰。
-* 超限时在每次新提交的同一把锁内，按版本号从旧到新淘汰，直到同时满足两条
-  上限。淘汰先删版本元数据再删数据文件，空间立即释放，计入既有
-  `OSG_QUOTA_BYTES` 配额记账（保留的每个版本按一份正文计空间，当前版本也
-  只计一次）。崩溃只可能留下待 `recover()` 回收的孤儿数据，不会留下悬挂
-  引用或"元数据在、正文没了"的半清理状态。`max_versions=1` 会被拒绝（等于
-  不保留历史，请直接关闭保留或传 ≥ 2）。
+  限；当前版本永远不计入淘汰、永远不会被淘汰。关闭保留期间存在的**冻结版
+  本**同样豁免于两条上限（冻结意味着"保留到删除该键为止"）。
+* 超限时在每次新提交（且保留处于开启状态）的同一把锁内，按版本号从旧到新
+  淘汰非冻结版本，直到同时满足两条上限。淘汰先删版本元数据再删数据文件，
+  空间立即释放，计入既有 `OSG_QUOTA_BYTES` 配额记账（保留的每个版本按一份
+  正文计空间，当前版本也只计一次）。崩溃只可能留下待 `recover()` 回收的孤
+  儿数据，不会留下悬挂引用或"元数据在、正文没了"的半清理状态。
+  `max_versions=1` 会被拒绝（等于不保留历史，请直接关闭保留或传 ≥ 2）。
 
 本地验证：
 
@@ -137,7 +152,37 @@ VID=...                                              # 取某条 version_id
 curl $B/version/$VID/k -H 'X-Identity: alice'        # 读取该版正文
 curl -X POST $B/version/$VID/k/rollback -H 'X-Identity: alice'
 curl $B/objects/k -H 'X-Identity: alice'             # 现在又是旧内容，版本号 +1
-uv run pytest tests/test_versioning.py -q -s         # 版本相关单测
+```
+
+本次修复涉及的三处行为可如下本地验证：
+
+```bash
+# 1) 对已有对象的桶开启保留：当前版本立即可按标识列出并读回
+curl -X PUT $B -H 'X-Identity: alice'
+curl -X PUT $B/objects/existing -H 'X-Identity: alice' --data before
+curl -X PUT $B/versioning -H 'X-Identity: alice' \
+  -H 'Content-Type: application/json' -d '{"enabled": true}'
+curl $B/versions/existing -H 'X-Identity: alice'     # 当前版本带非空 version_id
+# 2) 关闭保留后覆盖：当前版本仍在列表里且可按标识读，旧版本标记 frozen
+curl -X PUT $B/versioning -H 'X-Identity: alice' \
+  -H 'Content-Type: application/json' -d '{"enabled": false}'
+curl -X PUT $B/objects/existing -H 'X-Identity: alice' --data after
+curl $B/versions/existing -H 'X-Identity: alice'     # 当前版本仍为 is_current=true
+# 3) 已淘汰 / 不存在标识 -> NoSuchVersion；键不存在 -> NoSuchKey
+curl -i $B/version/$(printf 'ab%.0s' {1..16})/existing -H 'X-Identity: alice'
+```
+
+```bash
+uv run pytest tests/test_versioning.py -q -s        # 版本语义（含下列新增用例）
+# test_current_read_self_consistent_under_concurrent_overwrite
+#   并发覆盖时读"当前对象"，长度/etag/正文必属同一版（含未开启保留的桶）
+# test_enabling_versioning_gives_current_a_stable_id
+#   开启保留前后版本列表与标识的语义
+# test_disabling_versioning_keeps_current_listed_and_readable
+#   关闭保留后当前版本不消失、冻结历史可读
+# test_evicted_and_unknown_ids_are_distinguishable_not_found
+#   淘汰/不存在标识与键不存在的可区分 404
+uv run pytest -q                                     # 全量回归
 ```
 
 ## 错误分类（稳定契约）
@@ -179,14 +224,18 @@ uv run pytest tests/test_versioning.py -q -s         # 版本相关单测
   孤儿数据"，绝不会出现"有元数据无数据"。
 * 开启保留的版本同样遵守上述次序：版本数据先落盘（immutable，文件名即
   version_id），再原子提交版本元数据与当前对象元数据；淘汰先删版本元数据。
-  旧内容迁入版本存储期间崩溃，恢复时会清掉遗留的旧路径数据。
+  开启保留时存量对象迁入版本存储的动作是幂等的：中途崩溃后重试会认领已落
+  盘的同内容半成品版本，不会因旧路径数据已搬走而失败；更早阶段遗留的旧路
+  径数据则由 `recover()` 清掉。
 * 启动时 `recover()` 清理孤儿数据、残留 tmp 与无主体的分片目录，报告可
   在 `GET /healthz` 查看；进行中的分段上传跨重启保留并可续传。版本存储中
   无当前对象的版本目录、无 VersionMeta 的版本数据、缺数据文件的
   VersionMeta 都会被回收，且当前存活对象的版本不受影响。
 * 所有变更在全局锁（桶注册表 + 配额记账）与桶级锁内串行执行。锁顺序固定
-  为"全局锁 → 桶锁"；版本读取只在桶锁内完成"定位元数据 + 打开数据文件"
-  这一快照动作，之后的正文流式传输不持锁、不受覆盖与淘汰影响。
+  为"全局锁 → 桶锁"；无论读当前对象还是读历史版本，都只在桶锁内完成"定位
+  元数据 + 打开数据文件"这一快照动作，之后的正文流式传输不持锁、不受并发
+  覆盖/淘汰/删除影响（POSIX 已打开文件的 inode 不受 rename/unlink 影响），
+  所以响应头与正文永远描述同一份内容。
 
 ## 配置项（环境变量）
 

@@ -27,6 +27,11 @@ class BucketMeta:
     # When True, overwrites/merges preserve the previous content as a
     # read-only historical version instead of destroying it.
     versioning_enabled: bool = False
+    # Sticky: latched True the first time versioning is enabled and never
+    # cleared. While True, every write is content-addressed in version
+    # storage with a stable version id, even if retention is currently
+    # disabled, so the current version is always listable/readable by id.
+    versioning_ever_enabled: bool = False
     # Retention limits for historical versions, per key. 0 = unlimited.
     # Oldest non-current versions are evicted first; the current version is
     # never evicted.
@@ -41,6 +46,7 @@ class BucketMeta:
         return cls(name=d["name"], owner=d["owner"],
                    created_at=d["created_at"], policy=d.get("policy", {}),
                    versioning_enabled=d.get("versioning_enabled", False),
+                   versioning_ever_enabled=d.get("versioning_ever_enabled", False),
                    max_versions=d.get("max_versions", 0),
                    max_version_bytes=d.get("max_version_bytes", 0))
 
@@ -76,6 +82,10 @@ class VersionMeta:
     size: int
     etag: str
     created_at: float           # when this content became current
+    # True for versions frozen when versioning is disabled: retained
+    # indefinitely (retention limits only apply while versioning is on)
+    # until the key is deleted.
+    frozen: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -83,7 +93,8 @@ class VersionMeta:
     @classmethod
     def from_dict(cls, d: dict) -> "VersionMeta":
         return cls(key=d["key"], version=d["version"], version_id=d["version_id"],
-                   size=d["size"], etag=d["etag"], created_at=d["created_at"])
+                   size=d["size"], etag=d["etag"], created_at=d["created_at"],
+                   frozen=d.get("frozen", False))
 
 
 @dataclass
