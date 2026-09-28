@@ -28,3 +28,16 @@ def make_client(tmp_path):
         s = Settings(data_dir=tmp_path / "data", min_part_size=1, **overrides)
         return TestClient(create_app(s)), s
     return _make
+
+
+@pytest.fixture
+def thread_client(client):
+    """Factory for genuinely concurrent requests: a TestClient serialises
+    calls made through one shared portal, so concurrency tests must hand
+    each thread its own client bound to the same app."""
+    app = client.app
+
+    def _make():
+        return TestClient(app)
+
+    return _make

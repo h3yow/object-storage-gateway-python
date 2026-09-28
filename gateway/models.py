@@ -27,9 +27,15 @@ class BucketMeta:
     # When True, overwrites/merges preserve the previous content as a
     # read-only historical version instead of destroying it.
     versioning_enabled: bool = False
+    # Sticky: set True the first time retention is enabled and never reset.
+    # While versioning_enabled can be toggled off, a bucket that once had
+    # retention keeps every current committed through version storage, so the
+    # current version always has a stable, re-referenceable version_id even
+    # after retention is disabled (only new-history preservation stops).
+    versioned_ever: bool = False
     # Retention limits for historical versions, per key. 0 = unlimited.
     # Oldest non-current versions are evicted first; the current version is
-    # never evicted.
+    # never evicted. Limits apply only while versioning_enabled is True.
     max_versions: int = 0        # keep at most this many versions per key
     max_version_bytes: int = 0   # cap total bytes of kept versions per key
 
@@ -41,6 +47,7 @@ class BucketMeta:
         return cls(name=d["name"], owner=d["owner"],
                    created_at=d["created_at"], policy=d.get("policy", {}),
                    versioning_enabled=d.get("versioning_enabled", False),
+                   versioned_ever=d.get("versioned_ever", False),
                    max_versions=d.get("max_versions", 0),
                    max_version_bytes=d.get("max_version_bytes", 0))
 

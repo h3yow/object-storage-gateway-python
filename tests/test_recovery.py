@@ -82,6 +82,41 @@ def test_orphan_upload_data_removed_on_restart(settings):
     assert client.get("/buckets/b/uploads", headers=ALICE).json()["uploads"] == []
 
 
+def test_interrupted_enable_migration_recovers_cleanly(settings):
+    import hashlib
+    import json
+    import uuid
+    client = TestClient(create_app(settings))
+    client.put("/buckets/b", headers=ALICE)
+    client.put("/buckets/b/objects/k", headers=ALICE, content=b"hello-body")
+    bdir = settings.data_dir / "buckets" / "b"
+    kh = hashlib.sha256(b"k").hexdigest()
+    vid = uuid.uuid4().hex
+    # simulate a crash mid-enable-migration: data copied + VersionMeta written,
+    # ObjectMeta not yet repointed, bucket flag not committed, legacy body kept
+    (bdir / "versions-data" / kh).mkdir(parents=True, exist_ok=True)
+    (bdir / "versions" / kh).mkdir(parents=True, exist_ok=True)
+    (bdir / "versions-data" / kh / vid).write_bytes(b"hello-body")
+    (bdir / "versions" / kh / f"{vid}.json").write_text(json.dumps(
+        {"key": "k", "version": 1, "version_id": vid, "size": 10,
+         "etag": hashlib.sha256(b"hello-body").hexdigest(), "created_at": 1.0}))
+    print("\n[case] restart after interrupted enable-migration is safe")
+    client, report = _reopen(settings)
+    print("  recovery report:", report)
+    assert client.get("/buckets/b/objects/k", headers=ALICE).content == b"hello-body"
+    # enabling now must reuse the frozen copy (idempotent), not duplicate it
+    client.put("/buckets/b/versioning", headers=ALICE, json={"enabled": True})
+    versions = client.get("/buckets/b/versions/k", headers=ALICE).json()["versions"]
+    assert [(v["version"], v["is_current"]) for v in versions] == [(1, True)]
+    assert versions[0]["version_id"] == vid
+    assert client.get(f"/buckets/b/version/{vid}/k",
+                      headers=ALICE).content == b"hello-body"
+    metas = {p.stem for p in (bdir / "versions").rglob("*.json")}
+    datas = {p.name for p in (bdir / "versions-data").rglob("*") if p.is_file()}
+    assert metas == datas and metas == {vid}
+    print("  migration retried idempotently: one version, one body")
+
+
 def test_version_storage_orphans_recovered(settings):
     import hashlib
     import json

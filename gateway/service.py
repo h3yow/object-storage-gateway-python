@@ -44,6 +44,7 @@ class GatewayService:
         self._validate_retention(max_versions, max_version_bytes)
         meta = BucketMeta(name=name, owner=identity, policy=policy or {},
                           versioning_enabled=versioning_enabled,
+                          versioned_ever=versioning_enabled,
                           max_versions=max_versions,
                           max_version_bytes=max_version_bytes)
         self.store.create_bucket(meta)
@@ -66,19 +67,27 @@ class GatewayService:
                        max_version_bytes: int | None = None) -> BucketMeta:
         """Enable/disable historical retention and adjust its limits.
         Only the owner may change it. Disabling keeps already-kept versions
-        readable; only subsequent overwrites stop preserving history."""
+        readable; only subsequent overwrites stop preserving history.
+
+        Enabling for the first time eagerly migrates every existing object
+        into version storage (inside the same locked, persisted transition),
+        so once the call returns, each key's current version already carries
+        a stable, re-referenceable version id."""
         bucket = self._bucket_or_404(name)
         if bucket.owner != identity:
             raise AccessDenied("only the bucket owner may change versioning")
-        if enabled is not None:
-            bucket.versioning_enabled = bool(enabled)
         if max_versions is not None:
             self._validate_retention(max_versions, bucket.max_version_bytes)
             bucket.max_versions = max_versions
         if max_version_bytes is not None:
             self._validate_retention(bucket.max_versions, max_version_bytes)
             bucket.max_version_bytes = max_version_bytes
-        self.store.update_bucket(bucket)
+        enabling = enabled is not None and bool(enabled) and not bucket.versioning_enabled
+        if enabled is not None:
+            bucket.versioning_enabled = bool(enabled)
+        # store persists the (possibly sticky) flag and runs the enable
+        # migration atomically before committing the bucket metadata.
+        self.store.set_versioning(bucket, enabling=enabling)
         return bucket
 
     def list_buckets(self, identity: str) -> list[BucketMeta]:
@@ -122,8 +131,28 @@ class GatewayService:
         return meta
 
     def read_object(self, identity: str, bucket: str, key: str) -> tuple[ObjectMeta, Iterator[bytes]]:
-        meta = self.get_object_meta(identity, bucket, key)
-        return meta, self.store.read_object_stream(bucket, key)
+        self._authorize(bucket, identity, "read")
+        # The current header (size/etag/version_id) and the body are resolved
+        # and the body file opened in one bucket-lock snapshot; afterwards the
+        # stream reads a fixed inode. A concurrent overwrite/delete can no
+        # longer make the header describe one version and the body another.
+        meta, f = self.store.open_current_read(bucket, key)
+        if meta is None:
+            from .errors import NoSuchKey
+            raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
+        chunk = self.store.settings.stream_chunk_size
+
+        def _stream():
+            try:
+                while True:
+                    buf = f.read(chunk)
+                    if not buf:
+                        break
+                    yield buf
+            finally:
+                f.close()
+
+        return meta, _stream()
 
     def list_objects(self, identity: str, bucket: str, prefix: str = "",
                      marker: str = "", limit: int | None = None):
@@ -136,40 +165,67 @@ class GatewayService:
 
     # -- historical versions ---------------------------------------------------
     def list_versions(self, identity: str, bucket: str, key: str) -> list[dict]:
-        """All versions of the key, newest first, each flagged as current."""
+        """All versions of the key, newest first, each flagged as current.
+
+        The current pointer and the version set are read in one store-level
+        snapshot (single bucket lock), so the listing can never describe a
+        current version that the listed body of a concurrent read could miss.
+
+        The current version is always included:
+
+          * in a bucket that has (or once had) retention, the current content
+            lives in version storage and therefore already has a stable,
+            re-referenceable ``version_id`` -- including right after enabling
+            (existing objects are migrated then) and right after disabling
+            plus overwriting;
+          * in a bucket where retention was never enabled, the single current
+            legacy content is reported with an empty ``version_id`` (no
+            version storage is used, ordinary read/write behaviour unchanged).
+        """
         self._authorize(bucket, identity, "read")
-        current = self.store.get_object_meta(bucket, key)
+        current, versions = self.store.snapshot_current_and_versions(bucket, key)
         if current is None:
             from .errors import NoSuchKey
             raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
-        versions = self.store.list_versions(bucket, key)
-        out = []
-        if not versions and not current.version_id:
-            # legacy current: versioning never archived it, but the current
-            # content is still a listable/readable "version".
-            out.append(self._version_view(VersionMeta(
-                key=current.key, version=current.version, version_id="",
-                size=current.size, etag=current.etag,
-                created_at=current.updated_at), current, legacy=True))
+        current_in_list = any(v.version_id == current.version_id for v in versions)
+        out: list[dict] = []
+        if not current_in_list:
+            # Legacy current in a never-versioned bucket (empty id), or a
+            # defensive fallback: expose the exact current content as the
+            # current entry so header and listed version never disagree.
+            vid = current.version_id or ""
+            listed = next((v for v in reversed(versions) if v.version_id == vid), None)
+            if listed is None:
+                listed = VersionMeta(
+                    key=current.key, version=current.version, version_id=vid,
+                    size=current.size, etag=current.etag,
+                    created_at=current.updated_at)
+            out.append(self._version_view(listed, current))
         for v in reversed(versions):
             out.append(self._version_view(v, current))
-        return out
+        # de-duplicate (defensive fallback above may overlap the stored list)
+        seen: set = set()
+        unique: list[dict] = []
+        for d in out:
+            sig = (d["version"], d["version_id"])
+            if sig in seen:
+                continue
+            seen.add(sig)
+            unique.append(d)
+        return unique
 
     @staticmethod
-    def _version_view(v: VersionMeta, current: ObjectMeta, legacy: bool = False) -> dict:
+    def _version_view(v: VersionMeta, current: ObjectMeta) -> dict:
         d = v.to_dict()
-        d["is_current"] = legacy or (v.version_id == current.version_id)
+        d["is_current"] = (v.version_id == current.version_id)
         d["current_version"] = current.version
         return d
 
     def read_version(self, identity: str, bucket: str, key: str, version_id: str):
         self._authorize(bucket, identity, "read")
-        current = self.store.get_object_meta(bucket, key)
-        if current is None:
-            from .errors import NoSuchKey
-            raise NoSuchKey(f"object '{key}' does not exist in bucket '{bucket}'")
-        # open + metadata are resolved under one bucket lock in the store,
-        # so the returned header and body are the same immutable version.
+        # Key existence, version existence, body open: one store snapshot, so
+        # the returned header and body are the same immutable version and the
+        # two 404 flavours (NoSuchKey vs NoSuchVersion) cannot race.
         return self.store.read_version_stream(bucket, key, version_id)
 
     def rollback_version(self, identity: str, bucket: str, key: str,
